@@ -1,0 +1,10 @@
+name = "school-agent-team"
+main = "worker.js"
+compatibility_date = "2026-05-05"
+
+# Set this secret before using the AI chat endpoint:
+# wrangler secret put OPENAI_API_KEY
+#
+# If Cloudflare's egress region cannot call OpenAI directly, deploy
+# ../proxy_server in an OpenAI-supported region and set:
+# wrangler secret put OPENAI_PROXY_URL

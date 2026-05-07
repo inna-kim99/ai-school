@@ -11,3 +11,9 @@ services:
         sync: false
       - key: OPENAI_MODEL
         value: gpt-4.1-mini
+      - key: MAX_BODY_BYTES
+        value: "131072"
+      - key: MAX_MESSAGES
+        value: "24"
+      - key: MAX_CONTENT_CHARS
+        value: "24000"

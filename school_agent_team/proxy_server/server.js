@@ -1,160 +1,57 @@
-import http from "node:http";
+import http from "http";
+import fs from "fs";
+import path from "path";
+import { fileURLToPath } from "url";
 
+const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const PORT = Number(process.env.PORT || 3000);
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
 const OPENAI_MODEL = process.env.OPENAI_MODEL || "gpt-4.1-mini";
-const MAX_BODY_BYTES = Number(process.env.MAX_BODY_BYTES || 128 * 1024);
-const MAX_MESSAGES = Number(process.env.MAX_MESSAGES || 24);
-const MAX_CONTENT_CHARS = Number(process.env.MAX_CONTENT_CHARS || 24000);
+const SUPABASE_URL = (process.env.SUPABASE_URL || "").replace(/\/$/, "");
+const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
+const now = () => new Date().toISOString();
 
-function sendJson(response, status, payload) {
-  response.writeHead(status, {
-    "content-type": "application/json; charset=utf-8",
-    "access-control-allow-origin": "*",
-    "access-control-allow-methods": "POST, OPTIONS, GET",
-    "access-control-allow-headers": "content-type"
-  });
-  response.end(JSON.stringify(payload));
+function readJsonFile(file, fallback) {
+  try { return JSON.parse(fs.readFileSync(path.join(root, file), "utf8")); } catch { return fallback; }
 }
 
-function sendError(response, status, message) {
-  sendJson(response, status, {
-    answer: null,
-    error: message
-  });
-}
-
-async function readJson(request) {
-  const chunks = [];
-  let totalBytes = 0;
-
-  for await (const chunk of request) {
-    totalBytes += chunk.length;
-    if (totalBytes > MAX_BODY_BYTES) {
-      throw new Error("REQUEST_TOO_LARGE");
-    }
-    chunks.push(chunk);
-  }
-
-  if (!chunks.length) {
-    return {};
-  }
-
-  return JSON.parse(Buffer.concat(chunks).toString("utf8"));
-}
-
-function validateMessages(messages) {
-  if (!Array.isArray(messages) || messages.length === 0) {
-    return "messages 배열이 필요합니다.";
-  }
-
-  if (messages.length > MAX_MESSAGES) {
-    return `messages는 최대 ${MAX_MESSAGES}개까지만 보낼 수 있습니다.`;
-  }
-
-  const totalChars = messages.reduce((sum, message) => {
-    return sum + (typeof message.content === "string" ? message.content.length : 0);
-  }, 0);
-
-  if (totalChars > MAX_CONTENT_CHARS) {
-    return "요청 내용이 너무 깁니다. 대화 기록을 줄여 주세요.";
-  }
-
-  for (const message of messages) {
-    if (!message || !["system", "user", "assistant"].includes(message.role)) {
-      return "messages에는 system, user, assistant 역할만 사용할 수 있습니다.";
-    }
-    if (typeof message.content !== "string" || !message.content.trim()) {
-      return "각 message.content는 비어 있지 않은 문자열이어야 합니다.";
-    }
-  }
-
-  return null;
-}
-
-const server = http.createServer(async (request, response) => {
-  if (request.method === "OPTIONS") {
-    sendJson(response, 200, { ok: true, error: null });
-    return;
-  }
-
-  if (request.method === "GET" && request.url === "/health") {
-    sendJson(response, 200, {
-      ok: true,
-      service: "school-agent-team-openai-proxy",
-      model: OPENAI_MODEL,
-      error: null
-    });
-    return;
-  }
-
-  if (request.method !== "POST" || !["/api/chat", "/chat", "/"].includes(request.url || "")) {
-    sendError(response, 404, "요청한 경로를 찾을 수 없습니다.");
-    return;
-  }
-
-  if (!OPENAI_API_KEY) {
-    sendError(response, 500, "OPENAI_API_KEY가 Render 환경변수에 설정되어 있지 않습니다.");
-    return;
-  }
-
-  try {
-    const body = await readJson(request);
-    const messages = Array.isArray(body.messages) ? body.messages : [];
-    const validationError = validateMessages(messages);
-
-    if (validationError) {
-      sendError(response, 400, validationError);
-      return;
-    }
-
-    const model = typeof body.model === "string" && body.model.trim() ? body.model.trim() : OPENAI_MODEL;
-    const temperature = typeof body.temperature === "number" ? body.temperature : 0.45;
-
-    // TODO: Responses API로 전환할 경우 이 fetch 호출부를 교체하면 됩니다.
-    const openaiResponse = await fetch("https://api.openai.com/v1/chat/completions", {
-      method: "POST",
-      headers: {
-        authorization: `Bearer ${OPENAI_API_KEY}`,
-        "content-type": "application/json"
-      },
-      body: JSON.stringify({
-        model,
-        messages,
-        temperature
-      })
-    });
-
-    const data = await openaiResponse.json().catch(() => ({}));
-    if (!openaiResponse.ok) {
-      sendJson(response, openaiResponse.status, {
-        answer: null,
-        error: (data.error && data.error.message) || "OpenAI API 요청에 실패했습니다."
-      });
-      return;
-    }
-
-    sendJson(response, 200, {
-      answer:
-        (data.choices &&
-          data.choices[0] &&
-          data.choices[0].message &&
-          data.choices[0].message.content) ||
-        "답변을 생성하지 못했습니다.",
-      model,
-      usage: data.usage || null,
-      error: null
-    });
-  } catch (error) {
-    if (error instanceof Error && error.message === "REQUEST_TOO_LARGE") {
-      sendError(response, 413, "요청 본문이 너무 큽니다.");
-      return;
-    }
-
-    sendError(response, 500, "프록시 서버에서 요청을 처리하는 중 문제가 발생했습니다.");
-  }
+const agentsRaw = readJsonFile("shared/agents.json", [
+  { id: "learning_manager", name: "학습 매니저", type: "response", role: "학습 흐름 조율", description: "목표와 단계를 정리합니다.", category_group: "common", default_visible: true },
+  { id: "concept_teacher", name: "개념 설명자", type: "response", role: "개념 설명", description: "쉽게 설명합니다.", category_group: "common", default_visible: true },
+  { id: "practice_coach", name: "실습 코치", type: "response", role: "실습 안내", description: "작은 실습을 제안합니다.", category_group: "common", default_visible: true },
+  { id: "archive_manager", name: "학습 기록 관리자", type: "background", role: "기록", description: "요약합니다.", category_group: "common", default_visible: true }
+]);
+const categoriesRaw = readJsonFile("shared/categories.json", [
+  { id: "tech", name: "기술·IT·프로그래밍", recommended_agent_ids: ["learning_manager", "concept_teacher", "practice_coach", "archive_manager"], examples: ["AI 에이전트 만들기"], safety_notes: [] }
+]);
+const prompts = readJsonFile("shared/prompt_templates.json", {
+  system_base: "너는 개인용 AI 학습관리 에이전트다. 한국어로 답변한다.",
+  response_format: "1. 핵심 답변 2. 현재 학습 주제와의 연결 3. 지금 단계에서 알아야 할 수준 4. 직접 해볼 수 있는 것 5. 다음 학습 방향 6. 저장/진도 업데이트 정보",
+  learning_flow_rule: "질문에는 답하되 현재 학습 흐름과 연결한다.",
+  safety_rule: "위험하면 안전 주의사항을 포함한다."
 });
 
-server.listen(PORT, () => {
-  console.log(`School Agent Team OpenAI proxy is running on port ${PORT}`);
-});
+const agents = agentsRaw.map(a => ({ slug: a.slug || a.id, id: a.slug || a.id, name: a.name, role: a.role || "", description: a.description || "", agent_type: a.agent_type || a.type || "response", type: a.agent_type || a.type || "response", category_group: a.category_group || "common", is_default: a.is_default === 1 || a.default_visible ? 1 : 0, triggers: a.triggers || [] }));
+const categories = categoriesRaw.map(c => ({ ...c, recommended_agent_slugs: c.recommended_agent_slugs || c.recommended_agent_ids || [], recommended_agent_ids: c.recommended_agent_ids || c.recommended_agent_slugs || [] }));
+
+function json(res, status, body) { res.writeHead(status, { "content-type": "application/json; charset=utf-8", "access-control-allow-origin": "*", "access-control-allow-methods": "GET,POST,PATCH,DELETE,OPTIONS", "access-control-allow-headers": "content-type" }); res.end(JSON.stringify(body)); }
+function err(res, status, message) { json(res, status, { answer: null, error: message }); }
+async function body(req) { const chunks = []; let n = 0; for await (const c of req) { n += c.length; if (n > 262144) throw Error("REQUEST_TOO_LARGE"); chunks.push(c); } return chunks.length ? JSON.parse(Buffer.concat(chunks).toString("utf8")) : {}; }
+function hasDb() { return Boolean(SUPABASE_URL && SUPABASE_SERVICE_ROLE_KEY); }
+async function db(p, opt = {}) { if (!hasDb()) throw Object.assign(Error("SUPABASE_NOT_CONFIGURED"), { status: 503 }); const r = await fetch(`${SUPABASE_URL}/rest/v1${p}`, { method: opt.method || "GET", headers: { apikey: SUPABASE_SERVICE_ROLE_KEY, authorization: `Bearer ${SUPABASE_SERVICE_ROLE_KEY}`, "content-type": "application/json", prefer: opt.prefer || "return=representation", ...(opt.headers || {}) }, body: opt.body === undefined ? undefined : JSON.stringify(opt.body) }); const t = await r.text(); const d = t ? JSON.parse(t) : null; if (!r.ok) throw Object.assign(Error((d && d.message) || "Supabase 요청 실패"), { status: r.status }); return d; }
+
+async function seedAgents() { if (!hasDb()) return; const e = await db("/agents?select=id&limit=1", { headers: { prefer: "" } }); if (e && e.length) return; await db("/agents", { method: "POST", body: agents.map(a => ({ slug: a.slug, name: a.name, role: a.role, description: a.description, agent_type: a.agent_type, category_group: a.category_group, is_default: Boolean(a.is_default) })) }); }
+function rec(category) { const c = categories.find(x => x.id === category || x.name === category); return (c && c.recommended_agent_slugs) || ["learning_manager", "concept_teacher", "practice_coach", "archive_manager"]; }
+function roadmap(t) { const d = `${t.duration_value || ""}${t.duration_unit || ""}`; const base = `주제: ${t.name}\n목표: ${t.goal || "실행 가능한 수준까지 성장"}\n방식: ${t.learning_style || "균형형"}`; if (d.includes("2주")) return `${base}\n1주차: 핵심 개념\n2주차: 작은 실습 완성`; if (d.includes("1개월")) return `${base}\n1주차: 기초\n2주차: 기본 실습\n3주차: 응용\n4주차: 미니 프로젝트`; if (d.includes("3개월")) return `${base}\n1개월차: 기초\n2개월차: 응용 실습\n3개월차: 개인 프로젝트`; if (d.includes("6개월") || d.includes("1년")) return `${base}\n1단계: 기초\n2단계: 구조와 원리\n3단계: 실습\n4단계: 응용\n5단계: 사례 분석\n6단계: 포트폴리오`; return `${base}\n1단계: 용어\n2단계: 예제\n3단계: 응용\n4단계: 결과물`; }
+function safety(t, q) { const s = `${t.category || ""} ${t.name || ""} ${q}`; if (/주식|투자|ETF|차트|재무제표|금리/.test(s)) return "투자 내용은 학습 목적이며 매수/매도 지시나 수익 보장을 제공하지 않습니다."; if (/요가|운동|자세|통증/.test(s)) return "통증이 있으면 즉시 중단하고 필요하면 전문가와 상담하세요."; if (/목공|공구|제작|절단|분진|소음/.test(s)) return "보호구를 착용하고 절단, 분진, 소음, 전동공구 위험을 확인하세요."; if (/전자|전기|220V|배터리|전원부|리튬|커패시터|분해/.test(s)) return "220V, 전원부, 리튬 배터리, 고전압 커패시터 분해는 위험합니다. 저전압 실습으로 대체하세요."; return ""; }
+function route(q, topic, enabled) { const pool = enabled.length ? enabled.map(a => ({ ...a, slug: a.slug || a.id, agent_type: a.agent_type || a.type })) : agents.filter(a => rec(topic.category).includes(a.slug)); const out = new Map(); const add = ids => ids.forEach(id => { const a = pool.find(x => x.slug === id); if (a) out.set(a.slug, a); }); add(["learning_manager"]); for (const a of pool) if ((a.triggers || []).some(k => q.includes(k))) out.set(a.slug, a); if (/개념|뭐야|정의|이해/.test(q)) add(["concept_teacher", "tech_concept_teacher", "academic_concept_explainer"]); if (/실습|연습|따라/.test(q)) add(["practice_coach", "cad_3d_coach", "conversation_partner"]); if (/제작|만들|프로젝트|완성/.test(q)) add(["build_sequence_designer", "project_mentor"]); if (/오류|문제|막힘|안 돼/.test(q)) add(["problem_solver", "failure_analyst", "debugging_coach"]); if (/위험|220V|배터리|공구|통증|투자|주식/.test(q)) add(["safety_manager", "risk_manager"]); if (!out.size) add(rec(topic.category).slice(0, 3)); return [...out.values()].filter(a => (a.agent_type || "response") === "response").slice(0, 4); }
+async function openai(messages) { if (!OPENAI_API_KEY) throw Object.assign(Error("OPENAI_API_KEY가 Render 환경변수에 설정되어 있지 않습니다."), { status: 500 }); const r = await fetch("https://api.openai.com/v1/chat/completions", { method: "POST", headers: { authorization: `Bearer ${OPENAI_API_KEY}`, "content-type": "application/json" }, body: JSON.stringify({ model: OPENAI_MODEL, messages, temperature: 0.45 }) }); const d = await r.json().catch(() => ({})); if (!r.ok) throw Object.assign(Error((d.error && d.error.message) || "OpenAI API 요청 실패"), { status: r.status }); return { answer: d.choices?.[0]?.message?.content || "답변을 생성하지 못했습니다.", model: OPENAI_MODEL, usage: d.usage || null }; }
+async function topic(id) { const r = await db(`/topics?select=*&id=eq.${id}&limit=1`, { headers: { prefer: "" } }); return r && r[0]; }
+async function enabledAgents(id) { const r = await db(`/topic_agents?select=agent_id,is_enabled,agents(*)&topic_id=eq.${id}&is_enabled=eq.true`, { headers: { prefer: "" } }); return (r || []).map(x => x.agents).filter(Boolean); }
+function meta(topic, q) { let c = /실습|연습/.test(q) ? "04_실습기록" : /프로젝트|제작|완성/.test(q) ? "05_프로젝트" : /오류|문제|막힘/.test(q) ? "06_문제해결" : "01_기초개념"; const title = q.replace(/[^\p{L}\p{N}\s_-]/gu, "").trim().slice(0, 36).replace(/\s+/g, "_") || "학습_기록"; return { category: c, subcategory: topic.category || "general", title, file_path: `learning_archive/${topic.name}/${c}/${title}.md` }; }
+async function createTopic(b) { await seedAgents(); const rm = roadmap(b); const rows = await db("/topics", { method: "POST", body: { category: b.category, name: b.name, description: `${b.description || ""}\n\n## 초기 로드맵\n${rm}`.trim(), goal: b.goal, target_level: b.target_level, current_level: b.current_level, duration_value: b.duration_value, duration_unit: b.duration_unit, learning_style: b.learning_style, progress_percent: 0, current_stage: "시작: 목표 설정과 기초 진단", created_at: now(), updated_at: now() } }); const t = rows[0]; const slugs = b.agent_slugs?.length ? b.agent_slugs : rec(b.category); const as = await db(`/agents?select=id,slug&slug=in.(${slugs.map(encodeURIComponent).join(",")})`, { headers: { prefer: "" } }); if (as.length) await db("/topic_agents", { method: "POST", body: as.map(a => ({ topic_id: t.id, agent_id: a.id, is_enabled: true })) }); return { topic: t, roadmap: rm }; }
+async function learn(b) { const t = await topic(b.topic_id); if (!t) throw Object.assign(Error("학습 주제를 찾을 수 없습니다."), { status: 404 }); const en = await enabledAgents(t.id); const selected = b.auto_route === false ? en.filter(a => a.agent_type === "response").slice(0, 4) : route(b.user_input, t, en); const warn = safety(t, b.user_input); const prompt = [prompts.system_base, prompts.learning_flow_rule, prompts.response_format, warn, `주제: ${t.name}`, `목표: ${t.goal || ""}`, `현재 단계: ${t.current_stage || ""}`, `진도율: ${t.progress_percent || 0}%`, `참여 에이전트: ${selected.map(a => `${a.name}(${a.role})`).join(", ")}`].filter(Boolean).join("\n\n"); const ai = await openai([{ role: "system", content: prompt }, { role: "user", content: b.user_input }]); const m = meta(t, b.user_input); const used = selected.map(a => a.name); const delta = b.auto_progress === false ? 0 : /프로젝트|완성|제작/.test(b.user_input) ? 3 : /실습|연습/.test(b.user_input) ? 2 : 1; const prev = Number(t.progress_percent || 0), next = Math.min(100, prev + delta); let lesson = null; if (b.auto_save !== false) { lesson = (await db("/lessons", { method: "POST", body: { topic_id: t.id, title: m.title, user_input: b.user_input, ai_response: ai.answer, summary: ai.answer.slice(0, 500), used_agents: JSON.stringify(used), created_at: now() } }))[0]; await db("/archive_notes", { method: "POST", body: { topic_id: t.id, lesson_id: lesson.id, category: m.category, subcategory: m.subcategory, title: m.title, content: `# ${m.title}\n\n## 질문\n${b.user_input}\n\n## 답변\n${ai.answer}`, file_path: m.file_path, created_at: now() } }); } if (delta) { const stage = next >= 50 ? "응용 실습과 문제 해결" : next >= 20 ? "기초 실습과 구조 이해" : "기초 개념 이해"; await db(`/topics?id=eq.${t.id}`, { method: "PATCH", body: { progress_percent: next, current_stage: stage, updated_at: now() } }); await db("/progress_logs", { method: "POST", body: { topic_id: t.id, lesson_id: lesson && lesson.id, previous_progress: prev, new_progress: next, stage, progress_note: `질문과 답변 완료로 ${delta}%p 업데이트`, created_at: now() } }); } return { answer: ai.answer, used_agents: used, summary: ai.answer.slice(0, 500), archive_title: m.title, archive_category: m.category, archive_subcategory: m.subcategory, archive_path: m.file_path, progress_note: delta ? `${prev}% → ${next}%` : "자동 진도 업데이트 꺼짐", progress_delta: delta, safety_note: warn, model: ai.model, usage: ai.usage, error: null }; }
+
+async function handle(req, res) { const u = new URL(req.url || "/", `http://${req.headers.host}`), p = u.pathname; if (req.method === "GET" && p === "/health") return json(res, 200, { ok: true, service: "school-agent-team-openai-proxy", model: OPENAI_MODEL, supabase: hasDb(), error: null }); if (req.method === "GET" && p === "/api/bootstrap") { await seedAgents(); return json(res, 200, { agents, categories, supabase: hasDb(), error: null }); } if (req.method === "GET" && p === "/api/topics") return json(res, 200, { topics: await db("/topics?select=*&order=updated_at.desc", { headers: { prefer: "" } }), error: null }); if (req.method === "POST" && p === "/api/topics") { const b = await body(req); if (!b.name || !b.category) return err(res, 400, "category와 name은 필수입니다."); return json(res, 200, { ...(await createTopic(b)), error: null }); } const m = p.match(/^\/api\/topics\/(\d+)(?:\/(agents|lessons|archive|progress))?$/); if (m) { const id = m[1], child = m[2]; if (req.method === "GET" && !child) return json(res, 200, { topic: await topic(id), error: null }); if (req.method === "GET" && child === "agents") return json(res, 200, { agents: await enabledAgents(id), error: null }); if (req.method === "POST" && child === "agents") { const b = await body(req); await db(`/topic_agents?topic_id=eq.${id}`, { method: "DELETE", prefer: "return=minimal" }); const slugs = b.agent_slugs || []; const as = slugs.length ? await db(`/agents?select=id,slug&slug=in.(${slugs.map(encodeURIComponent).join(",")})`, { headers: { prefer: "" } }) : []; if (as.length) await db("/topic_agents", { method: "POST", body: as.map(a => ({ topic_id: Number(id), agent_id: a.id, is_enabled: true })) }); return json(res, 200, { ok: true, error: null }); } if (req.method === "GET" && child === "lessons") return json(res, 200, { lessons: await db(`/lessons?select=*&topic_id=eq.${id}&order=created_at.desc`, { headers: { prefer: "" } }), error: null }); if (req.method === "GET" && child === "archive") return json(res, 200, { notes: await db(`/archive_notes?select=*&topic_id=eq.${id}&order=created_at.desc`, { headers: { prefer: "" } }), error: null }); if (req.method === "GET" && child === "progress") return json(res, 200, { logs: await db(`/progress_logs?select=*&topic_id=eq.${id}&order=created_at.desc`, { headers: { prefer: "" } }), error: null }); } if (req.method === "POST" && p === "/api/learn") return json(res, 200, await learn(await body(req))); if (req.method === "POST" && ["/api/chat", "/chat", "/"].includes(p)) { const b = await body(req); const r = await openai(b.messages || []); return json(res, 200, { ...r, error: null }); } err(res, 404, "요청한 경로를 찾을 수 없습니다."); }
+
+http.createServer(async (req, res) => { if (req.method === "OPTIONS") return json(res, 200, { ok: true, error: null }); try { await handle(req, res); } catch (e) { if (e.message === "REQUEST_TOO_LARGE") return err(res, 413, "요청 본문이 너무 큽니다."); if (e.message === "SUPABASE_NOT_CONFIGURED") return err(res, 503, "SUPABASE_URL 또는 SUPABASE_SERVICE_ROLE_KEY가 Render 환경변수에 설정되어 있지 않습니다."); err(res, e.status || 500, e.message || "서버 오류가 발생했습니다."); } }).listen(PORT, () => console.log(`Personal learning agent proxy is running on port ${PORT}`));

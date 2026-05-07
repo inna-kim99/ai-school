@@ -4,8 +4,8 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "start": "node server.js",
-    "check": "node --check server.js"
+    "start": "node server2.js",
+    "check": "node --check server2.js"
   },
   "engines": {
     "node": ">=18"

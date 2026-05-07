@@ -12,8 +12,12 @@ services:
       - key: OPENAI_MODEL
         value: gpt-4.1-mini
       - key: MAX_BODY_BYTES
-        value: "131072"
+        value: "262144"
       - key: MAX_MESSAGES
         value: "24"
       - key: MAX_CONTENT_CHARS
-        value: "24000"
+        value: "30000"
+      - key: SUPABASE_URL
+        sync: false
+      - key: SUPABASE_SERVICE_ROLE_KEY
+        sync: false
